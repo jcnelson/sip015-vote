@@ -40,7 +40,7 @@ check_deps() {
    done
 
    # stacks-inspect must support `dump-txs`
-   if [ -z "$(stacks-inspect dump-txs 2>&1 | grep 'dump-txs')" ]; then
+   if ! stacks-inspect dump-txs 2>&1 | grep 'dump-txs'; then
       error_exit "stacks-inspect does not appear to support dump-txs"
    fi
 
@@ -83,7 +83,6 @@ find_stackers() {
    # stdout: none
    # stderr: lots of diagnostics
    # return: 0 on success, non-zero on error
-   local vote_rc
    "$LIBEXEC/addrtool" find-stackers "$VOTE_RC_1" "$DATA/cycle-*.json" > "$DATA/potential-stackers-$VOTE_RC_1.json"
    "$LIBEXEC/addrtool" find-stackers "$VOTE_RC_2" "$DATA/cycle-*.json" > "$DATA/potential-stackers-$VOTE_RC_2.json"
    return 0
@@ -175,4 +174,4 @@ main() {
    echo "Final tabulation in $DATA/votes-final.json"
 }
 
-main $@
+main "$@"
