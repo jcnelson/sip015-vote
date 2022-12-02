@@ -1,0 +1,1643 @@
+#!/usr/bin/env node
+
+const c32 = require('c32check');
+const bitcoin = require('bitcoinjs-lib');
+const process = require('node:process');
+const fs = require('node:fs');
+const stx = require("@stacks/transactions");
+
+const CONFIG = {
+  mainnet: true,
+  node: "http://52.0.54.100:20443",
+  pox: "pox",
+  boot_addr: c32.c32address(22, '0000000000000000000000000000000000000000'),
+  api: "https://stacks-node-api.mainnet.stacks.co",
+  stx_yes_addr: 'SP00000000000003SCNSJTCHE66N2PXHX',
+  stx_no_addr: 'SP00000000000000DSQJTCHE66XE1NHQ',
+  btc_yes_addr: '11111111111111X6zHB1ZC2FmtnqJ',
+  btc_no_addr: '1111111111111117CrbcZgemVNFx8',
+  supported_cycles: [46, 47],
+  cycles: [
+    {
+      // cycle 46
+      burn_height: (1 + 46 * 2100 + 666050),
+      stacks_tip: "50d86246c633c8fefba5b1b938324ce271e6bd5dde8cf03e852ea9cb0024ee3d",
+    },
+    {
+      // cycle 47
+      burn_height: (1 + 47 * 2100 + 666050),
+      stacks_tip: "34e14ffb63160f2c0f64520371e11c8c5e8143ac872ed62d2580b066962e4271",
+    }
+  ],
+  debug: true
+}
+
+function debug(msg) {
+  if (CONFIG.debug) {
+    console.error(msg);
+  }
+}
+
+function JSON_to_string(obj) {
+  return JSON.stringify(obj, (key, value) =>
+    typeof value === 'bigint' ? value.toString() : value
+  );
+}
+
+// JSON.stringify and exit, with bigint support
+function printOrExit(res) {
+  if (res !== undefined) {
+    console.log(JSON_to_string(res));
+  }
+  else {
+    process.exit(1);
+  }
+}
+
+// Convert a Bitcoin b58check address to a Stacks c32check address
+function btc_addr_to_stx_addr(btc_addr) {
+  return c32.b58ToC32(btc_addr);
+}
+
+// Convert a secp256k1 public key to a Bitcoin address
+function p2pkh_pubkey_to_btc_addr(pubkey) {
+  const { address } = bitcoin.payments.p2pkh({ pubkey })
+  return address;
+}
+
+// Convert a multisig script into a Bitcoin address
+function p2sh_pubkeys_to_btc_addr(pubkeys, m) {
+  const { address } = bitcoin.payments.p2sh({
+    redeem: bitcoin.payments.p2ms({
+      m: 2,
+      pubkeys: pubkeys,
+    })
+  });
+  return address;
+}
+
+// Convert a p2wpkh-p2sh witness script into a Bitcoin address
+function p2wpkh_p2sh_pubkey_to_btc_addr(pubkey) {
+  const { address } = bitcoin.payments.p2sh({
+    redeem: bitcoin.payments.p2wpkh( { pubkey: pubkey } )
+  });
+  return address;
+}
+
+// Convert a p2wsh-p2sh witness script into a Bitcoin address
+function p2wsh_p2sh_pubkeys_to_btc_addr(pubkeys, m) {
+  const { address } = bitcoin.payments.p2sh({
+    redeem: bitcoin.payments.p2wsh({
+      redeem: bitcoin.payments.p2ms({ m, pubkeys }),
+    }),
+  });
+  return address;
+}
+
+// Convert a version byte and a hash160 to a Bitcoin address.
+// `pox_version` and `pox_hashbytes` are both Buffers
+function pox_addr_to_btc_addr(mainnet, pox_version, pox_hashbytes) {
+  let c32_version = 0;
+  const singlesig = mainnet ? c32.versions.mainnet.p2pkh : c32.versions.testnet.p2pkh;
+  const multisig = mainnet ? c32.versions.mainnet.p2sh : c32.versions.testnet.p2sh;
+  const btc_version = pox_version[0];
+  if (btc_version === 0) {
+     c32_version = singlesig;
+  }
+  else if (btc_version === 1) {
+     c32_version = multisig;
+  }
+  else if (btc_version === 2) {
+     c32_version = multisig;
+  }
+  else if (btc_version === 3) {
+     c32_version = multisig;
+  }
+  else {
+     throw 'Unknown PoX version'
+  }
+  const c32addr = c32.c32address(c32_version, pox_hashbytes.toString('hex'));
+  return c32.c32ToB58(c32addr);
+}
+
+// Decode a script the form of <m <pubkey1> <pubkey2> ... <pubkeym> n OP_CHECKMULTISIG>
+// Returns { m, pubkeys }
+function decode_multisig_script(sig_script_buf) {
+  const sig_script = bitcoin.script.decompile(sig_script_buf);
+  if (!Number.isInteger(sig_script[0])) {
+    // expected m
+    throw "Invalid scriptSig -- could not find m"
+  }
+  const m = sig_script[0] - 80;
+  if (sig_script.length != m + 3) {
+    // missing n and op_checkmultisig
+    throw "Invalid scriptSig -- not long enough for given m"
+  }
+  const n = sig_script[m + 1] - 80;
+  if (n < m) {
+    // invalid multisig script
+    throw "Invalid scriptSig -- n < m"
+  }
+  if (sig_script[m+2] !== 174) {
+    // missing last opcode
+    throw "Invalid scriptSig -- last opcode is not OP_CHECKMULTISIG"
+  }
+  const pubkeys = sig_script.slice(1, m+1);
+  const ret = {
+    pubkeys,
+    m
+  };
+  return ret;
+}
+
+// Decode a scriptSig into its BTC and STX addresses
+function decode_scriptsig(script_hex, witness_hex) {
+  const script = bitcoin.script.decompile(Buffer.from(script_hex, 'hex'));
+  const witness = witness_hex.map(wp => Buffer.from(wp, 'hex'));
+
+  // p2pkh scriptSig?
+  if (script.length === 2) {
+    const pubkey = script[1];
+    const btc_addr = p2pkh_pubkey_to_btc_addr(pubkey);
+    const ret = {
+      'btc': btc_addr,
+      'stx': btc_addr_to_stx_addr(btc_addr)
+    };
+    return ret;
+  }
+
+  // p2sh multisig scriptSig?
+  if (script.length > 2 && script[0] === 0 && witness.length === 0) {
+    const { m, pubkeys } = decode_multisig_script(script[script.length - 1]);
+    const btc_addr = p2sh_pubkeys_to_btc_addr(pubkeys, m);
+    const ret = {
+      'btc': btc_addr,
+      'stx': btc_addr_to_stx_addr(btc_addr)
+    };
+    return ret;
+  }
+
+  // segwit-p2sh scriptSig?
+  if (witness.length > 0) {
+    // p2wpkh-p2sh?
+    if (script.length === 1 && script[0].length === 22) {
+      if (witness.length !== 2) {
+        throw 'Invalid scriptSig -- witness length is not 2 but have p2wpkh-p2sh';
+      }
+      const pubkey = witness[1];
+      const btc_addr = p2wpkh_p2sh_pubkey_to_btc_addr(pubkey);
+      const ret = {
+        'btc': btc_addr,
+        'stx': btc_addr_to_stx_addr(btc_addr)
+      };
+      return ret;
+    }
+    // p2wsh-p2sh?
+    if (script.length === 1 && script[0].length === 34) {
+      const { m, pubkeys } = decode_multisig_script(witness[witness.length - 1]);
+      const btc_addr = p2wsh_p2sh_pubkeys_to_btc_addr(pubkeys, m);
+      const ret = {
+        'btc': btc_addr,
+        'stx': btc_addr_to_stx_addr(btc_addr)
+      };
+      return ret;
+    }
+  }
+
+  throw 'Unrecognized scriptsig and witness'
+}
+
+// Call a read-only function.
+// `sender` is a string representation of a principal
+// `function_args` are hex-encoded Clarity values
+// Returns a hex-encoded Clarity value.
+async function call_read_only(node, contract_addr, contract_name, function_name, function_args, mainnet, sender, tip) {
+  let url = `${node}/v2/contracts/call-read/${contract_addr}/${contract_name}/${function_name}`;
+  if (!!tip) {
+    url = `${url}?tip=${tip}`;
+  }
+  const body = {
+    sender: sender,
+    arguments: function_args
+  };
+  
+  debug(url);
+
+  let res;
+  let data;
+
+  try {
+    res = await fetch(url, {
+      method: 'post',
+      body: JSON.stringify(body),
+      headers: { 'content-type': 'application/json' }
+    });
+  }
+  catch(error) {
+    console.error(error);
+    return undefined;
+  }
+  
+  if (!res.ok) {
+    console.error(`HTTP ${res.status}: ${await res.text()}`);
+    return undefined;
+  }
+
+  try {
+    data = await res.json();
+  }
+  catch(error) {
+    console.error(error);
+    return undefined;
+  }
+
+  const encodedCV = data.result;
+  return encodedCV.toString('hex');
+}
+
+// Get a map entry
+async function get_map_entry(node, contract_addr, contract_name, map_name, map_key, tip) {
+  let qsv = [];
+  if (!!tip) {
+    qsv.push(`tip=${tip}`);
+  }
+  qsv.push(`proof=0`);
+
+  let qs = qsv.length === 0 ? "" : `?${qsv.join("&")}`;
+
+  const url = `${node}/v2/map_entry/${contract_addr}/${contract_name}/${map_name}${qs}`;
+  const body = JSON.stringify(map_key);
+
+  debug(url);
+
+  let res;
+  let data;
+
+  try {
+    res = await fetch(url, {
+      method: 'post',
+      body: body,
+      headers: { 'content-type': 'application/json' }
+    });
+  }
+  catch(error) {
+    console.error(error);
+    return undefined;
+  }
+  
+  if (!res.ok) {
+    console.error(`HTTP ${res.status}: ${await res.text()}`);
+    return undefined;
+  }
+
+  try {
+    data = await res.json();
+  }
+  catch(error) {
+    console.error(error);
+    return undefined;
+  }
+
+  return data.data;
+}
+
+// Is a stacker delegating?
+// delegating_table = {
+//    stx_addr: { until_burn_ht: integer|null, .. }
+// }
+function is_stacker_delegating(stx_addr, delegating_table, cur_burn_height) {
+  const rec = delegating_table[stx_addr];
+  if (!rec) {
+    return false;
+  }
+  return (!rec.until_burn_ht || rec.until_burn_ht >= cur_burn_height);
+}
+
+// Given a Stacker's address, go and see how many STX they are delegating to.
+// Returns {
+//    ustx: amount of ustx delegated (as a bigint)
+//    delegate_to: principal that controls the STX (as a string)
+//    until_burn_ht: if given, the height at which the delegation expires (as a bigint), or null if it doesn't expire
+// }
+async function get_delegation_info(config, stacker_addr, cur_burn_height, chain_tip) {
+  const stacker_cv = stx.serializeCV(stx.tupleCV({ "stacker": stx.standardPrincipalCV(stacker_addr) })).toString('hex');
+  const stacker_info_cv_hex = await get_map_entry(config.node, config.boot_addr, config.pox, "delegation-state", stacker_cv, chain_tip);
+  if (!stacker_info_cv_hex) {
+    throw 'Failed to get delegate sttate'
+  }
+  if (stacker_info_cv_hex == `0x${stx.serializeCV(stx.noneCV()).toString('hex')}`) {
+    return null;
+  }
+  else {
+    const result = stx.hexToCV(stacker_info_cv_hex);
+    const amount_delegated = result.value.data['amount-ustx'].value;
+    const until_burn_height =
+      result.value.data['until-burn-ht'].type === 10    // 10 == 'some'
+      ? result.value.data['until-burn-ht'].value.value
+      : null;
+
+    const delegate_addr_version = result.value.data['delegated-to'].address.version;
+    const delegate_addr_hashbytes = result.value.data['delegated-to'].address.hash160;
+    const delegate_to = c32.c32address(delegate_addr_version, delegate_addr_hashbytes);
+    const ret = {
+      ustx: amount_delegated,
+      delegate_to: delegate_to,
+      until_burn_ht: until_burn_height
+    };
+    return ret;
+  }
+}
+
+// Given a Stacker's address, go and get its PoX address and amount stacked.
+// delegating_table = {
+//    stx_addr: { until_burn_ht: integer|null, .. }
+// }
+// Returns {
+//    pox_address: the bitcoin address (as a string),
+//    stx_address: the stx address (as a string),
+//    ustx: the amount of uSTX stacked (as a bigint)
+//    delegating: whether or not these STX are delegated to someone else (as a bool)
+// }
+async function get_stacker_info(config, stacker_addr, cur_burn_height, chain_tip, delegating_table) {
+  const stacker_cv = stx.serializeCV(stx.standardPrincipalCV(stacker_addr)).toString('hex');
+  const stacker_info_cv_hex = await call_read_only(config.node, config.boot_addr, config.pox, "get-stacker-info", [stacker_cv], config.mainnet, 'SP31DA6FTSJX2WGTZ69SFY11BH51NZMB0ZW97B5P0', chain_tip);
+  if (!stacker_info_cv_hex) {
+    throw 'Failed to get stacker info'
+  }
+
+  if (stacker_info_cv_hex == `0x${stx.serializeCV(stx.noneCV()).toString('hex')}`) {
+    return null;
+  }
+  else {
+    const result = stx.hexToCV(stacker_info_cv_hex);
+    const amount_stacked = result.value.data['amount-ustx'].value;
+    const pox_addr_version = result.value.data['pox-addr'].data.version.buffer;
+    const pox_addr_hashbytes = result.value.data['pox-addr'].data.hashbytes.buffer;
+    const pox_addr = pox_addr_to_btc_addr(config.mainnet, pox_addr_version, pox_addr_hashbytes);
+    const is_delegating = is_stacker_delegating(stacker_addr, delegating_table, cur_burn_height);
+    const ret = {
+      pox_address: pox_addr,
+      stx_address: stacker_addr,
+      ustx: amount_stacked,
+      delegating: is_delegating
+    };
+    return ret;
+  }
+}
+
+// Decode a signer's signing mode and bytes in an auth struct.
+// Return the address
+function decode_auth_signer(mainnet, signer) {
+  const singlesig = mainnet ? c32.versions.mainnet.p2pkh : c32.versions.testnet.p2pkh;
+  const multisig = mainnet ? c32.versions.mainnet.p2sh : c32.versions.testnet.p2sh;
+
+  const hash_mode = signer.hash_mode;
+  const hash_bytes = signer.signer;
+
+  if (hash_mode === "P2PKH") {
+    return c32.c32address(singlesig, hash_bytes);
+  }
+  else {
+    return c32.c32address(multisig, hash_bytes);
+  }
+}
+
+// Decode a transaction auth payload into its origin stacks address.
+// Returns the address as a string.
+function decode_tx_sender(mainnet, payload) {
+  if (Object.keys(payload).length !== 1) {
+    throw 'Auth payload has multiple keys'
+  }
+
+  const type = Object.keys(payload)[0];
+  let origin = null;
+
+  if (type === "Standard") {
+    if (Object.keys(payload[type]).length !== 1) {
+      throw 'Standard auth has multiple keys'
+    }
+    const signing_mode = Object.keys(payload[type])[0];
+    origin = decode_auth_signer(mainnet, payload[type][signing_mode]);
+  }
+  else if (type === "Sponsored") {
+    const origin_signer = payload[type][0];
+    if (Object.keys(origin_signer).length !== 1) {
+      throw 'Sponsored auth origin has multiple keys'
+    }
+    const signing_mode = Object.keys(origin_signer)[0];
+    origin = decode_auth_signer(mainnet, origin_signer[signing_mode]);
+  }
+  else {
+    throw 'Neither Standard nor Sponsored'
+  }
+
+  return origin;
+}
+
+
+// Given a transaction, determine if it's a stacking transaction
+// Returns the contract-call payload if it's a stacking transaction we're interested in.
+// Returns null otherwise.
+//
+// Returns {
+//    cc_payload: contract-call transaction payload
+//    tx_sender: principal that sent this transaction
+// }
+function get_stacking_payload(mainnet, boot_addr, pox_name, tx_json) {
+  const payload = tx_json['payload'];
+  if (Object.keys(payload).length !== 1) {
+    throw 'Transaction payload has multiple keys'
+  }
+
+  const type = Object.keys(payload)[0];
+  if (type !== "ContractCall") {
+    return null;
+  }
+  const cc_payload = payload['ContractCall'];
+  const address_parts = cc_payload['address'];
+  const contract_name = cc_payload['contract_name'];
+  const function_name = cc_payload['function_name'];
+
+  const address = c32.c32address(address_parts.version, address_parts.bytes);
+  if (address !== boot_addr) {
+    return null;
+  }
+  if (contract_name !== pox_name) {
+    return null;
+  }
+  if (function_name !== "stack-stx" && function_name !== "delegate-stack-stx" && function_name != "delegate-stx") {
+    return null;
+  }
+
+  const tx_sender = decode_tx_sender(mainnet, tx_json['auth']);
+  const ret = {
+    cc_payload,
+    tx_sender
+  };
+  return ret;
+}
+
+// Decode a principal
+function decode_principal(principal_data) {
+  const type = Object.keys(principal_data)[0];
+  if (type === "Standard") {
+    const standard = principal_data[type];
+    return c32.c32address(standard[0], Buffer.from(standard[1]).toString('hex'));
+  }
+  else if (type === "Contract") {
+    const contract = principal_data[type];
+    const issuer_data = contract['issuer'];
+    const name = contract['name'];
+    const issuer = c32.c32address(issuer_data[0], Buffer.from(issuer_data[1]).toString('hex'));
+    return `${issuer}.${name}`;
+  }
+  else {
+    throw 'Unrecognized principal type'
+  }
+}
+
+// Decode a contract-call principal.
+// Returns the address as a string. Can be a standard or contract principal.
+function decode_cc_principal(cc_principal) {
+  const principal_data = cc_principal['Principal'];
+  if (!principal_data) {
+    throw 'Not a principal'
+  }
+  if (Object.keys(principal_data).length !== 1) {
+    throw 'Principal argument has multiple keys'
+  }
+  return decode_principal(principal_data);
+}
+
+// Given a contract-call payload, extract the useful information out of it.
+// Returns {
+//  function_name: the name of the pox function
+//  stacker: the address of the entity in the `stacking-state` table, if this succeeded
+//  delegator: the address stacking for this entity
+// }
+function decode_stacking_payload(stacking_payload) {
+  const cc_payload = stacking_payload['cc_payload'];
+  const tx_sender = stacking_payload['tx_sender'];
+  const function_name = cc_payload['function_name'];
+  if (function_name === "stack-stx") {
+    const ret = {
+      function_name,
+      stacker: tx_sender,
+      delegator: null
+    };
+    return ret;
+  }
+  else if (function_name === "delegate-stx") {
+    const args = cc_payload['function_args'];
+    const delegate_to = args[1];
+    const ret = {
+      function_name,
+      stacker: tx_sender,
+      delegator: decode_cc_principal(delegate_to)
+    };
+    return ret;
+  }
+  else if (function_name === "delegate-stack-stx") {
+    const args = cc_payload['function_args'];
+    const for_stacker = args[0];
+    const ret = {
+      function_name,
+      stacker: decode_cc_principal(for_stacker),
+      delegator: tx_sender
+    };
+    return ret;
+  }
+  else {
+    return null;
+  }
+}
+
+// Given a burnchain-hosted stack-stx operation, get back useful information
+// Returns {
+//   function_name: "stack-stx",
+//   stacker: the address of the entity in the `stacking-state` table
+//   delegator: null
+// }
+function decode_stack_stx_tx(stack_stx_tx) {
+  const sender = stack_stx_tx['sender'];
+  const tx_sender = c32.c32address(sender.version, sender.bytes);
+  const ret = {
+    function_name: "stack-stx",
+    stacker: tx_sender,
+    delegator: null
+  };
+  return ret;
+}
+
+// Decode a list of transactions
+function decode_tx_jsons(config, tx_jsons) {
+  const decoded_txs = tx_jsons
+    .map(rec => {
+      const payload = get_stacking_payload(config.mainnet, config.boot_addr, config.pox, rec);
+      if (payload) {
+        return decode_stacking_payload(payload);
+      }
+      else {
+        return null;
+      }
+    })
+    .filter(rec => {
+      return !!rec;
+    });
+
+  return decoded_txs;
+}
+
+// Find all potential stackers and delegators in a given reward cycle's tx dump.
+// Duplicate stackers are removed.
+// Returns {
+//    stackers: everyone potentially in the `stacking-state` table
+//    delegates: everyone potentially in the `delegation-state` table
+//    delegators: everyone potentially stacking on behalf of an entry in `delegates`
+// }
+function find_potential_stackers(config, tx_dump) {
+  const stackers = {};
+  const delegators = {};
+  const delegates = {};
+
+  for (block_data of tx_dump) {
+    const stack_stx_txs = block_data.stack_stx_txs;
+    const block_txs = block_data.block_txs;
+    const microblock_txs = block_data.microblock_txs;
+
+    const decoded_stack_stxs = stack_stx_txs
+      .map(rec => {
+        return decode_stack_stx_tx(rec);
+      });
+
+    const decoded_block_txs = decode_tx_jsons(config, block_txs);
+    
+    let decoded_microblock_txs = [];
+    for (let microblock_rec of microblock_txs) {
+      const decoded_mblock_rec = decode_tx_jsons(config, microblock_rec);
+      decoded_microblock_txs = decoded_microblock_txs.concat(decoded_mblock_rec);
+    }
+
+    // filter out duplicates
+    const all_transactions = decoded_stack_stxs.concat(decoded_block_txs).concat(decoded_microblock_txs);
+    for (let tx_rec of all_transactions) {
+      if (tx_rec.function_name === "delegate-stx") {
+        delegates[tx_rec.stacker] = 1;
+      }
+
+      if (!!tx_rec.stacker) {
+        stackers[tx_rec.stacker] = 1;
+      }
+      if (!!tx_rec.delegator) {
+        delegators[tx_rec.delegator] = 1;
+      }
+    }
+  }
+
+  const unique_stackers = Object.keys(stackers);
+  const unique_delegators = Object.keys(delegators);
+  const unique_delegates = Object.keys(delegates);
+  const ret = {
+    stackers: unique_stackers.sort(),
+    delegates: unique_delegates.sort(),
+    delegators: unique_delegators.sort(),
+  };
+  return ret;
+}
+
+// Given a list of stackers that are potentially delegating, go and find the delegation records for
+// those that actually are.  The queries against the chainstate will be done with respect to the 
+// given reward cycle identified by `cycle_info`.
+async function build_reward_cycle_delegation_table(config, delegates, cycle_info) {
+  const dt = {};
+  for (let delegate_addr of delegates) {
+    debug(`Get delegation record for ${delegate_addr}`);
+    const delrec = await get_delegation_info(config, delegate_addr, cycle_info.burn_height, cycle_info.stacks_tip);
+    if (!!delrec) {
+      dt[delegate_addr] = delrec;
+    }
+  }
+  return dt;
+}
+
+// Get the stacker infos for a list of potential stackers.  `delegating_table` must have been built already
+// using e.g. `buidl_reward_cycle_delegation_table`.
+async function get_reward_cycle_stackers(config, potential_stackers, delegating_table, cycle_info) {
+  const stackers = {};
+  for (let stacker_addr of potential_stackers) {
+    debug(`Get stacker record for ${stacker_addr}`);
+    const stacker_rec = await get_stacker_info(config, stacker_addr, cycle_info.burn_height, cycle_info.stacks_tip, delegating_table);
+    if (!!stacker_rec) {
+      stackers[stacker_addr] = stacker_rec;
+    }
+  }
+
+  return stackers;
+}
+
+// Find all potential stackers and delegators, given a list of paths on disk to tx dumps for each of 
+// the preceding reward cycles up to the cycle identified by `cycle_info`.
+// Returns {
+//    stackers: everyone potentially in the `stacking-state` table
+//    delegates: everyone potentially in the `delegation-state` table
+//    delegators: everyone potentially stacking on behalf of an entry in `delegates`
+// }
+function find_all_potential_stackers(config, tx_dump_paths) {
+  const stackers = {};
+  const delegators = {};
+  const delegates = {};
+
+  for (let tx_dump_path of tx_dump_paths) {
+    const tx_dump_data = fs.readFileSync(tx_dump_path);
+    const tx_dump = JSON.parse(tx_dump_data);
+    const potential_stackers = find_potential_stackers(config, tx_dump);
+
+    for (let stacker of potential_stackers.stackers) {
+      stackers[stacker] = 1;
+    }
+    for (let delegate of potential_stackers.delegates) {
+      delegates[delegate] = 1;
+    }
+    for (let delegator of potential_stackers.delegators) {
+      delegators[delegator] = 1;
+    }
+  }
+  
+  const unique_stackers = Object.keys(stackers);
+  const unique_delegators = Object.keys(delegators);
+  const unique_delegates = Object.keys(delegates);
+  
+  const ret = {
+    stackers: unique_stackers.sort(),
+    delegates: unique_delegates.sort(),
+    delegators: unique_delegators.sort(),
+  };
+  return ret;
+}
+
+// Is a transaction payload a token-transfer to a "yes" or "no" STX burn address?
+function decode_stacks_vote_tx(mainnet, yes_addr, no_addr, tx_json) {
+  const payload = tx_json['payload']['TokenTransfer'];
+  if (!payload) {
+    return null;
+  }
+  const recipient = decode_principal(payload[0]);
+  const sender = decode_tx_sender(mainnet, tx_json['auth']);
+
+  if (recipient === yes_addr) {
+    const ret = {
+      vote: 'yes',
+      sender
+    };
+    return ret;
+  }
+  else if (recipient === no_addr) {
+    const ret = {
+      vote: 'no',
+      sender
+    };
+    return ret;
+  }
+  else {
+    return null;
+  }
+}
+
+// Find all potential pooled stacker votes in a given reward cycle.
+// Returns [ { vote: "yes"|"no", sender: ... } ]
+function find_potential_pool_stackers(config, tx_reward_cycle_dump) {
+  const ret = [];
+  for (let tx_dump of tx_reward_cycle_dump) {
+    for (let tx of tx_dump.transfer_stx_txs) {
+      const sender = c32.c32address(tx.sender.version, tx.sender.bytes);
+      const recipient = c32.c32address(tx.recipient.version, tx.recipient.bytes);
+      if (recipient === config.stx_yes_addr) {
+        ret.push({ vote: 'yes', sender });
+      }
+      else if (recipient === config.stx_no_addr) {
+        ret.push({ vote: 'no', sender });
+      }
+    }
+    for (let tx of tx_dump.block_txs) {
+      const vote = decode_stacks_vote_tx(config.mainnet, config.stx_yes_addr, config.stx_no_addr, tx);
+      if (vote) {
+        ret.push(vote);
+      }
+    }
+    for (let mblock of tx_dump.microblock_txs) {
+      for (let tx of mblock) {
+        const vote = decode_stacks_vote_tx(config.mainnet, config.stx_yes_addr, config.stx_no_addr, tx);
+        if (vote) {
+          ret.push(vote);
+        }
+      }
+    }
+  }
+  return ret;
+}
+
+// Find all potential pooled stacker votes in a set of reward cycle tx dump files.
+// Returns { votes: [ { "sender": ..., "vote": ... } ], "invalid": [ sender ] }
+function find_all_potential_pooled_stacker_votes(config, tx_dump_filepaths) {
+  // first pass: identify and remove invalid votes
+  const all_voters = {};
+  const invalids = {};
+  for (let tx_dump_path of tx_dump_filepaths) {
+    debug(`Process ${tx_dump_path}`);
+    const tx_dump_data = fs.readFileSync(tx_dump_path);
+    const tx_dump = JSON.parse(tx_dump_data);
+    const votes = find_potential_pool_stackers(config, tx_dump);
+    for (let vote of votes) {
+      if (invalids[vote.sender]) {
+        continue;
+      }
+
+      if (!!all_voters[vote.sender]) {
+        if (all_voters[vote.sender].vote !== vote.vote) {
+          debug(`Sender ${vote.sender} voted "yes" and "no"`);
+          invalids[vote.sender] = 1;
+          all_voters[vote.sender] = undefined;
+        }
+      }
+      else {
+        all_voters[vote.sender] = vote;
+      }
+    }
+  }
+
+  const votes = [];
+  for (let sender of Object.keys(all_voters)) {
+    votes.push( { sender, vote: all_voters[sender].vote } );
+  }
+
+  const ret = {
+    votes,
+    invalid: Object.keys(invalids)
+  };
+  return ret;
+}
+
+// Find all potential pooled stacker voters.  This trawls the given tx dumps and looks for anyone
+// who sent STX to the "yes" or "no" addresses.
+//
+
+function usage_find_stackers() {
+  console.error(
+`Usage: ${process.argv[1]} find-stackers RC_ID DUMP_PATH [DUMP_PATH ...]\n` +
+`Where:\n` +
+`\n` +
+`   RC_ID                               This is the reward cycle. Currently supports 46 or 47.\n` +
+`   DUMP_PATH                           A path to a transaction dump, created by the 'stacks-inspect' tool.\n` +
+`\n`
+  );
+  process.exit(1);
+}
+
+function usage_combine_stackers() {
+  console.error(
+`Usage: ${process.argv[1]} combine-stackers STACKERS_FILE [STACKERS_FILE...]\n` +
+`Where:\n` +
+`\n` +
+`   STACKERS_FILE                       This is a set of potential stackers and delegating stackers in a reward cycle.\n` +
+`                                       This file is generated with the 'find-stackers' subcommand.\n` +
+`\n`
+  );
+  process.exit(1);
+}
+
+function usage_solo_stacker_votes() {
+  console.error(
+`Usage: ${process.argv[1]} solo-stacker-votes ALL_STACKERS BTC_TRANSACTIONS\n` +
+`Where:\n` +
+`\n` +
+`   ALL_STACKERS                        This is the path to the "all stackers" file, which contains the list of pooled and solo stackers.\n` +
+`                                       This file is generated with the 'combine-stackers' subcommand.\n` +
+`   BTC_TRANSACTIONS                    This is the path to the "yes" and "no" decoded BTC transactions.\n` +
+`                                       This file is generated with the included 'get-utxos.sh' script.\n` +
+`\n`
+  );
+  process.exit(1);
+}
+
+function usage_pool_stacker_votes() {
+  console.error(
+`Usage: ${process.argv[1]} pool-stacker-votes ALL_STACKERS DUMP_PATH [DUMP_PATH ...]\n` +
+`Where:\n` +
+`\n` +
+`   ALL_STACKERS                        This is the path to the "all stackers" file, which contains the list of pooled and solo stackers.\n` +
+`                                       This file is generated with the 'combine-stackers' subcommand.\n` +
+`   DUMP_PATH                           A path to a transaction dump, created by the 'stacks-inspect' tool.\n` +
+`\n`,
+  );
+  process.exit(1);
+}
+
+function usage_tabulate_votes() {
+  console.error(
+`Usage: ${process.argv[1]} tabulate SOLO_STACKERS_PATH POOL_STACKERS_PATH\n` +
+`Where:\n` +
+`\n` +
+`   SOLO_STACKERS_PATH                This is the path to the solo stackers file, which contains the set of valid solo stacker votes.\n` +
+`                                     This file is generated with the 'solo-stacker-votes' subcommand.\n` +
+`   POOL_STACKERS_PATH                This is the path to the pool stackers file, which contains the set of valid pool stacker votes.\n` +
+`                                     This file is generated with the 'pool-stacker-votes' subcommand.\n` +
+`\n`,
+  );
+  process.exit(1);
+}
+
+// Top-level method to go and find all of the stackers for a reward cycle.
+// argv[0] is the reward cycle ID (must be 46 or 47)
+// argv[1..] is the list of paths to reward cycle tx dumps.
+// Returns {
+//    delegating: { $stx_addr: delegation-state record }
+//    stackers: { $stx_addr: stacking-state record }
+// }
+async function find_stackers(config, argv) {
+  const rc_id = parseInt(argv[0]);
+  if (config.supported_cycles.indexOf(rc_id) < 0) {
+    usage_find_stackers();
+  }
+
+  const cycle_info = config.cycles[rc_id - config.supported_cycles[0]];
+
+  debug(`Loading potential stackers from ${JSON.stringify(argv.slice(1))}`);
+  const potential_stackers = find_all_potential_stackers(config, argv.slice(1));
+  
+  debug(`Building delegation table for ${potential_stackers.delegates.length} potential delegating stackers`);
+  const delegating_table = await build_reward_cycle_delegation_table(config, potential_stackers.delegates, cycle_info);
+
+  debug(`Getting reward cycle stackers for ${potential_stackers.stackers.length} potential stackers`);
+  const stackers = await get_reward_cycle_stackers(config, potential_stackers.stackers, delegating_table, cycle_info);
+
+  const ret = {
+    delegating: delegating_table,
+    stackers: stackers
+  };
+  return ret;
+}
+
+// Combine all stackers for a set of reward cycles.  In SIP-015, the only solo-stackers who can
+// vote are the ones who have stacked for both reward cycles 46 and 47.
+// stacker_paths[..] is the list of stacker JSON files.
+// Returns {
+//    solo_stackers: { $stx_addr: { pox_address: ..., ustx: ..., ... } }
+//    pool_stackers: { $stx_addr: { pox_address: ..., ustx: ..., delegator: ..., ... } },
+//    delegators: [ $stx_addr, ... ]
+// }
+function combine_stackers(stacker_paths) {
+  if (stacker_paths.length === 0) {
+    usage_combine_stackers();
+  }
+
+  let rc_stackers = [];
+  for (let stacker_path of stacker_paths) {
+    const stacker_data_str = fs.readFileSync(stacker_path);
+    const stacker_data = JSON.parse(stacker_data_str);
+    rc_stackers.push(stacker_data);
+  }
+
+  const stackers = {};
+  const solo_stackers = {};
+  const pool_stackers = {};
+  const delegators = {};
+
+  const initial_stackers = rc_stackers[0];
+  rc_stackers = rc_stackers.slice(1);
+  
+  // combine stackers common to all reward cycles
+  for (let stacker of Object.keys(initial_stackers.stackers)) {
+    let present = true;
+    let is_delegating = false;
+    let delegator = null;
+    for (let rc_stacker of rc_stackers) {
+      if (!rc_stacker.stackers[stacker]) {
+        debug(`Stacker ${stacker} missing from at least one reward cycle`);
+        present = false;
+        break;
+      }
+      if (rc_stacker.stackers[stacker].pox_address !== initial_stackers.stackers[stacker].pox_address ||
+          rc_stacker.stackers[stacker].ustx !== initial_stackers.stackers[stacker].ustx) {
+        // this shouldn't happen between two consecutive reward cycles
+        debug(`Stacker ${stacker} has a different record between reward cycles`);
+        debug(`Left: ${JSON.stringify(rc_stacker.stackers[stacker])}`);
+        debug(`Right: ${JSON.stringify(initial_stackers.stackers[stacker])}`);
+        throw 'Impossible stacking situation'
+      }
+      if (rc_stacker.stackers[stacker].delegating) {
+        is_delegating = true;
+        const delrec = rc_stacker.delegating[stacker];
+        if (!!delrec) {
+          if (delegator === null) {
+            delegator = delrec.delegate_to;
+          }
+          else if (delegator !== delrec['delegated-to']) {
+            debug(`Stacker ${stacker} has two different delegators: ${delegator} and ${delrec['delegated-to']}`);
+            throw 'Impossible stacking situation'
+          }
+        }
+        else {
+          debug(`No delegator record for ${stacker}`);
+        }
+      }
+    }
+    if (present) {
+      if (is_delegating) {
+        if (!delegator) {
+          throw `Did not find delegator for ${stacker}`
+        }
+        // this stacker is stacking in a pool
+        pool_stackers[stacker] = Object.assign(initial_stackers.stackers[stacker], { delegator });
+        delegators[delegator] = 1;
+      }
+      else {
+        // this stacker is stacking solo
+        solo_stackers[stacker] = initial_stackers.stackers[stacker];
+      }
+    }
+  }
+
+  const delegator_list = Object.keys(delegators);
+  const ret = {
+    solo_stackers,
+    pool_stackers,
+    delegators: delegator_list.sort()
+  };
+  return ret;
+}
+
+// Given a set of stackers, group them by PoX address.
+// `stackers` takes the form of { $stx_addr: { ustx: ..., pox_address: ..., ... } }
+// Returns { $pox_address: [ { $stx_address: ..., ustx: ... } ] }
+function group_stackers_by_pox_address(stackers) {
+  const ret = {};
+  for (let stacker_addr of Object.keys(stackers)) {
+    const rec = stackers[stacker_addr];
+    const pox_addr = rec['pox_address'];
+    const ustx = BigInt(rec['ustx']);
+    if (!ret[pox_addr]) {
+      ret[pox_addr] = [ { "stx_address": stacker_addr, "ustx": ustx, "pox_address": pox_addr } ];
+    }
+    else {
+      ret[pox_addr].push( { "stx_address": stacker_addr, "ustx": ustx, "pox_address": pox_addr } );
+    }
+  }
+  for (let pox_addr of Object.keys(ret)) {
+    debug(`${pox_addr}: ${JSON_to_string(ret[pox_addr])}`);
+  }
+  return ret;
+}
+
+// Identify the set of voters who voted "yes" or "no" from solo stacking.
+// Excludes stackers who are also delegators.
+// Argv is:
+// * argv[0]: path to the stackers file produced by combine_stackers()
+// * argv[1]: path to the BTC votes produced by get-utxos.sh
+// Returns [ "votes": { 'stx_address': ..., 'pox_address': ..., 'ustx': ..., 'vote': ... }, "invalid": [...] ]
+// * invalid votes are pool operators who tried to vote
+function find_solo_stacker_votes(argv) {
+  const stackers_filepath = argv[0];
+  const utxos_filepath = argv[1];
+
+  if (!stackers_filepath || !utxos_filepath) {
+    usage_solo_stacker_votes();
+  }
+
+  const stackers_data = fs.readFileSync(stackers_filepath);
+  const stackers = JSON.parse(stackers_data);
+
+  const utxos_data = fs.readFileSync(utxos_filepath);
+  const utxos = JSON.parse(utxos_data);
+
+  const delegator_set = {};
+  for (let delegator of stackers.delegators) {
+    delegator_set[delegator] = 1;
+  }
+
+  const pox_addrs = group_stackers_by_pox_address(stackers.solo_stackers);
+  const invalid = [];
+  
+  // match PoX address to a list of stackers
+  let voters = [];
+  for (let vote of ["yes", "no"]) {
+    for (let utxo of utxos[vote]) {
+      const witness = utxo.vin[0].txinwitness ? utxo.vin[0].txinwitness : [];
+      const btc_addr = decode_scriptsig(utxo.vin[0].scriptSig.hex, witness).btc;
+      debug(`check ${btc_addr} (${vote})`);
+      if (pox_addrs[btc_addr]) {
+        for (let voter_rec of pox_addrs[btc_addr]) {
+          if (delegator_set[voter_rec.stx_address]) {
+            debug(`${voter_rec.stx_address} is a pool operator, so it cannot vote`);
+            invalid.push(voter_rec.stx_address);
+          }
+          else {
+            debug(`${btc_addr}: Solo stacker ${voter_rec.stx_address} votes ${voter_rec.ustx} for '${vote}'`);
+            voters.push(Object.assign(voter_rec, { 'vote': vote }));
+          }
+        }
+      }
+    }
+  }
+  const ret = {
+    votes: voters,
+    invalid
+  };
+  return ret;
+}
+
+// Find all pooled stackers and their committed uSTX.
+// argv is:
+// * argv[0]: the path to the stackers.json file generated by combine_stackers()
+// * argv[1...n]: paths to the reward cycles in which to search for pool stacker votes
+// Returns { votes: { 'stx_address': ..., 'ustx': ..., 'vote': ... }, invalid: [...] }
+// * invalid votes are votes where the principal voted both "yes" and "no"
+function find_pool_stacker_votes(argv) {
+  if (argv.length < 2) {
+    usage_pool_stacker_votes();
+  }
+
+  const stackers_filepath = argv[0];
+  const reward_cycle_paths = argv.slice(1);
+  if (reward_cycle_paths.length === 0) {
+    usage_pool_stacker_votes();
+  }
+
+  const stackers_data = fs.readFileSync(stackers_filepath);
+  const stackers = JSON.parse(stackers_data);
+
+  const voters = [];
+  const potential_pool_stacker_votes = find_all_potential_pooled_stacker_votes(CONFIG, reward_cycle_paths);
+  for (let potential_vote of potential_pool_stacker_votes.votes) {
+    const stacker = potential_vote.sender;
+    const vote = potential_vote.vote;
+
+    if (!stackers.pool_stackers[stacker]) {
+      debug(`Account ${stacker} voted but is not pool-stacking`);
+      continue;
+    }
+    const ustx = stackers.pool_stackers[stacker].ustx;
+    const pox_address = stackers.pool_stackers[stacker].pox_address;
+    const delegator = stackers.pool_stackers[stacker].delegator;
+    voters.push( { stx_address: stacker, ustx, vote, pox_address, delegator } );
+  }
+  const res = {
+    votes: voters,
+    invalid: potential_pool_stacker_votes.invalid
+  };
+  return res;
+}
+
+// Tabulate all votes from solo and pool stackers.
+// Returns {
+//    "yes": {
+//       "total": ...,
+//       "voters": {
+//          "solo": [ ... ],
+//          "pool": [ ... ],
+//        },
+//    },
+//    "no": {
+//      "total": ...,
+//      "voters": {
+//        "solo": [ ... ],
+//        "pool": [ ... ],
+//      }
+//    }
+//    "invalid": [ ... ]
+// }
+//
+function tabulate_votes(argv) {
+  const solo_votes_path = argv[0];
+  const pool_votes_path = argv[1];
+
+  if (!solo_votes_path || !pool_votes_path) {
+    usage_tabulate_votes();
+  }
+
+  const solo_votes_data = fs.readFileSync(solo_votes_path);
+  const pool_votes_data = fs.readFileSync(pool_votes_path);
+
+  const solo_votes_json = JSON.parse(solo_votes_data);
+  const solo_votes = solo_votes_json
+    .votes
+    .map(voter => {
+      return Object.assign(voter, { type: "solo" })
+    });
+
+  const pool_votes_json = JSON.parse(pool_votes_data);
+  const pool_votes = pool_votes_json
+    .votes
+    .map(voter => {
+      return Object.assign(voter, { type: "pool" })
+    });
+
+  const all_votes = solo_votes.concat(pool_votes);
+  const invalid = solo_votes_json.invalid.concat(pool_votes_json.invalid);
+
+  // verify that there are no conflicting votes
+  const all_voters = {};
+  for (let voter of all_votes) {
+    const stacker = voter.stx_address;
+    if (all_voters[stacker]) {
+      // voted twice. It will be counted at most once.
+      // but did they vote in a conflicting manner?
+      if (all_voters[stacker].vote !== voter.vote || all_voters[stacker].ustx !== voter.ustx) {
+        debug(`Discard vote from ${stacker}`);
+        debug(`Left: ${JSON_to_string(all_voters[stacker])}`);
+        debug(`Right: ${JSON_to_string(voter)}`);
+        invalid.push(stacker);
+        continue;
+      }
+    }
+    else {
+      all_voters[stacker] = voter;
+    }
+  }
+
+  // clear invalid
+  for (let invalid_stacker of invalid) {
+    all_votes[invalid_stacker] = undefined;
+  }
+
+  // tally it up
+  let yes_total = 0n;
+  const yes_solo_voters = [];
+  const yes_pool_voters = [];
+  let no_total = 0n;
+  const no_solo_voters = [];
+  const no_pool_voters = [];
+
+  for (let stacker of Object.keys(all_voters)) {
+    const voter = all_voters[stacker];
+    if (voter.vote === 'yes') {
+      yes_total += BigInt(voter.ustx);
+      if (voter.type === "solo") {
+        yes_solo_voters.push(voter);
+      }
+      else if (voter.type === "pool") {
+        yes_pool_voters.push(voter);
+      }
+      else {
+        throw 'Unknown voter type'
+      }
+    }
+    else if (voter.vote === "no") {
+      no_total += BigInt(voter.ustx);
+      if (voter.type === "solo") {
+        no_solo_voters.push(voter);
+      }
+      else if (voter.type === 'pool') {
+        no_pool_voters.push(voter);}
+      else {
+        throw 'Unknown voter type'
+      }
+    }
+  }
+
+  const ret = {
+    yes: {
+      total: yes_total,
+      voters: {
+        solo: yes_solo_voters,
+        pool: yes_pool_voters
+      },
+    },
+    no: {
+      total: no_total,
+      voters: {
+        solo: no_solo_voters,
+        pool: no_pool_voters
+      }
+    },
+    invalid
+  };
+  return ret;
+}
+
+function usage() {
+  console.error(
+`Usage: ${process.argv[1]} command args\n` +
+`Where 'command' is:\n` +
+`\n` +
+`   find-stackers                       Find all of the stackers for a reward cycle\n`,
+`   combine-stackers                    Combine all reward cycle stackers into the set of qualified stackers\n`,
+`   solo-stacker-votes                  Find all solo-stacker votes\n`,
+`   pool-stacker-votes                  Find all pool-stacker votes\n`,
+`   tabulate                            Tabulate votes across all voting processes\n`
+  );
+  process.exit(1);
+}
+
+async function main() {
+  const argv = process.argv.slice(1);
+  const subcommand = argv[1];
+  if (subcommand === "find-stackers") {
+    const res = await find_stackers(CONFIG, argv.slice(2));
+    printOrExit(res);
+  }
+  else if (subcommand === "combine-stackers") {
+    const res = combine_stackers(argv.slice(2));
+    printOrExit(res);
+  }
+  else if (subcommand === "solo-stacker-votes") {
+    const res = find_solo_stacker_votes(argv.slice(2));
+    printOrExit(res);
+  }
+  else if (subcommand === "pool-stacker-votes") {
+    const res = find_pool_stacker_votes(argv.slice(2));
+    printOrExit(res);
+  }
+  else if (subcommand === "tabulate") {
+    const res = tabulate_votes(argv.slice(2));
+    printOrExit(res);
+  }
+  else {
+    usage();
+  }
+}
+
+/* ---------------------------------------------------------------------------------------------- */
+/* Unit tests                                                                                     */
+/* ---------------------------------------------------------------------------------------------- */
+function assert_eq(v1, v2) {
+  if (v1 !== v2) {
+    console.log(`left: ${v1}`);
+    console.log(`right: ${v2}`);
+    throw "Test failed"
+  }
+}
+
+function test_decode_scriptsig() {
+  console.log("decode_scriptsig...");
+  assert_eq(
+    decode_scriptsig("0047304402206af58d064c5cfb4128367d3fb7393527117bc98166fe6c736e84b513be9933ad02204b3da3d246b2e1d72dc993ccfb09626c3b066d7e43bcccc24e8f376fccb6bc0601483045022100ba8ce4d5d4a568f50f3cf7868d9dce687f1dbacfc98b8ea4c66722be6e35654a0220147da24ca66f553b39627ace2be658701ba36a42fc725565c79a608a3719711301475221031e5b50460922bfcea36dda0d45452af7b743e96ba01150d24d890f1878abd0d52103ff1f5fcb32a17fb645887180364a864df3e442ab838330dbd72f93199de305be52ae", []).btc,
+    "38CCKFZqyTZVx8DFUsBWKsoB4zLUVQ3H9Z"
+  );
+  assert_eq(
+    decode_scriptsig("483045022100e224ce381ae121cb59bcdbab86e2a06f9c2f288558dd4771bec72947bf2340b602204dcf2ba336b9209ae86d7468c5172b0459b004c66923e68fcb6d3f08c318a5240121035180521b9c167493d41ea30e7c2dc9c35b2a003d39317a20ccde837fb268b8df", []).btc,
+    "16sAXi1jxhxKCfY84hubDdnFNaAhqd5t49"
+  );
+  assert_eq(
+    decode_scriptsig("160014b6d5559c1a46ca1889cdd8452f9c502c7086b00d", ["30450221008907df2e70293be15d11f011bded1513ca52cf682aa4d648bc60da00a9890f2102206d533481cb70d42a1d56bd301ed33cc168966bedfb6a77391b73c621bcff575401", "02fd0eeabb835de0a5ba8e54b3e601b083a12a0dd56718c842e4908726b548156d"]).btc,
+    "38Jht2bzmJL4EwoFvvyFzejhfEb4J7KxLb"
+  );
+}
+
+async function test_get_stacker_info() {
+  console.log("get_stacker_info");
+  const ret = await get_stacker_info(CONFIG, "SM2KX7J6F4Z039FJHHDSW1VXFX1HF7310ZSNDRGCK", 765218, "707671abc39586d9b6cab2ea9a1ab44104683826bf2f0757b2027d3bf513ffd2", {});
+  assert_eq(ret.pox_address, "36hQtSEXBMevo5chpxhfAGiCTSC34QKgda");
+  assert_eq(ret.ustx, 25000000000000n);
+  assert_eq(ret.stx_address, "SM2KX7J6F4Z039FJHHDSW1VXFX1HF7310ZSNDRGCK");
+  assert_eq(ret.delegating, false);
+}
+
+async function test_get_delegation_info() {
+  console.log("get_delegation_info");
+  const ret = await get_delegation_info(CONFIG, "SPNYMG0TCS0YJTVR0XJVMNQNZDJJNQ5CGY6X1VV1", 765218, "707671abc39586d9b6cab2ea9a1ab44104683826bf2f0757b2027d3bf513ffd2");
+  assert_eq(ret.ustx, 862000000000n);
+  assert_eq(ret.delegate_to, "SP700C57YJFD5RGHK0GN46478WBAM2KG3A4MN2QJ");
+  assert_eq(ret.until_burn_ht, 771050n);
+}
+
+function test_decode_auth_signer() {
+  console.log("decode_auth_signer");
+  let ret = decode_auth_signer(true,
+    {
+      "hash_mode": "P2PKH",
+      "signer": "e6aaaf82611c55e2dcaeb9f631b0789e83b3896a",
+      "nonce": 4773,
+      "tx_fee": 1000000,
+      "key_encoding": "Uncompressed",
+      "signature": "00edca20cdbd3b1455a68072f0c0515e45544c09ca5c3ad8cd5c8d9b994476b3ec3edda7f8e28f61e7fa800128de01d91344f626918a865debefcee06b1a347639"
+    }
+  );
+  assert_eq(ret, "SP3KANBW2C4E5BRPWNTWZCCDGF2F87CW9D9KV0FFK");
+
+  ret = decode_auth_signer(
+    true,
+    { "hash_mode": "P2SH", "signer": "f372e589241de5f9721b3274325b76aae6214228", "nonce": 337, "tx_fee": 500000, "fields": [ { "Signature": [ "Compressed", "0196f690536d9c0178108986d3909aede07654f146788652d7cd7fc7b42f6f46e603508bd86c914e7c99aca6b14a1f05c04d8099b15401e594e6b69e6d3177c04b" ] }, { "PublicKey": { "key": "03d3a6fc3c213ad34cc27f503a5a7c1b6822adeb0fbfa2cb7fd0966c289649259b", "compressed": true } }, { "Signature": [ "Compressed", "00070abe86f62a4643512bdf1ef08fb6f096b72124b7a67b95312b63c59718722c28e5fa62a53374574f9be88ba4a5b51bc70a92e88938bc38638be287457a4352" ] } ], "signatures_required": 2 }
+  );
+  assert_eq(ret, "SM3SQ5SC94GEYBYBJ3CS78CJVETNEC8A2512NHMVR");
+}
+
+function test_decode_tx_sender() {
+  console.log("decode_tx_sender");
+  let ret = decode_tx_sender(
+    true,
+    { "Standard": { "Singlesig": { "hash_mode": "P2PKH", "signer": "e6aaaf82611c55e2dcaeb9f631b0789e83b3896a", "nonce": 4773, "tx_fee": 1000000, "key_encoding": "Uncompressed", "signature": "00edca20cdbd3b1455a68072f0c0515e45544c09ca5c3ad8cd5c8d9b994476b3ec3edda7f8e28f61e7fa800128de01d91344f626918a865debefcee06b1a347639" } } }
+  );
+  assert_eq(ret, "SP3KANBW2C4E5BRPWNTWZCCDGF2F87CW9D9KV0FFK");
+
+  ret = decode_tx_sender(
+    true,
+    { "Standard": { "Multisig": { "hash_mode": "P2SH", "signer": "f372e589241de5f9721b3274325b76aae6214228", "nonce": 337, "tx_fee": 500000, "fields": [ { "Signature": [ "Compressed", "0196f690536d9c0178108986d3909aede07654f146788652d7cd7fc7b42f6f46e603508bd86c914e7c99aca6b14a1f05c04d8099b15401e594e6b69e6d3177c04b" ] }, { "PublicKey": { "key": "03d3a6fc3c213ad34cc27f503a5a7c1b6822adeb0fbfa2cb7fd0966c289649259b", "compressed": true } }, { "Signature": [ "Compressed", "00070abe86f62a4643512bdf1ef08fb6f096b72124b7a67b95312b63c59718722c28e5fa62a53374574f9be88ba4a5b51bc70a92e88938bc38638be287457a4352" ] } ], "signatures_required": 2 } } }
+  );
+  assert_eq(ret, "SM3SQ5SC94GEYBYBJ3CS78CJVETNEC8A2512NHMVR");
+
+  ret = decode_tx_sender(
+    true,
+    { "Sponsored": [ { "Singlesig": { "hash_mode": "P2PKH", "signer": "33ae80cbac2426582f37148d912b353cd3a09537", "nonce": 592, "tx_fee": 0, "key_encoding": "Compressed", "signature": "0072598fdb60840f25ae0182500c78d291e119e6a95f020fda25b195c6e90e501e103e488a9aa344f8c5f499546a63b72a26b1ee899a5430cad16df5f90b9ac5c6" } }, { "Singlesig": { "hash_mode": "P2PKH", "signer": "661506d48705f932af21abcff23046b216886e84", "nonce": 4897, "tx_fee": 7000, "key_encoding": "Compressed", "signature": "01efc6d07de823d37e12a107ef619b4c982938dd5e1cd5b2e57c4925dcfca085365056ce4388de71ee42454d166e511a2b82595b99727ff8b7e79e45dfdcfc5d1a" } } ] }
+  );
+  assert_eq(ret, "SPSTX06BNGJ2CP1F6WA8V49B6MYD784N6YZMK95G");
+}
+
+function test_get_stacking_payload() {
+  console.log("get_stacking_payload");
+  let ret = get_stacking_payload(
+    true,
+    CONFIG.boot_addr,
+    "pox", 
+    { "version": "Mainnet", "chain_id": 1, "auth": { "Standard": { "Singlesig": { "hash_mode": "P2PKH", "signer": "fbca143a8bf324c287653c23686cdafee8eb2c94", "nonce": 6, "tx_fee": 260, "key_encoding": "Compressed", "signature": "00c45198553fd92306b545e73d8c62ab6207271c12a219863d206938fa71abc53f6da9c80f270363708adf12793c833445a7a08db4c8ec35272be4e789c68d2249" } } }, "anchor_mode": "Any", "post_condition_mode": "Deny", "post_conditions": [], "payload": { "ContractCall": { "address": { "version": 22, "bytes": "0000000000000000000000000000000000000000" }, "contract_name": "pox", "function_name": "stack-stx", "function_args": [ { "UInt": 560004000000 }, { "Tuple": { "type_signature": { "type_map": { "hashbytes": { "SequenceType": { "BufferType": 20 } }, "version": { "SequenceType": { "BufferType": 1 } } } }, "data_map": { "hashbytes": { "Sequence": { "Buffer": { "data": [ 228, 203, 158, 176, 37, 12, 216, 229, 246, 127, 199, 160, 80, 2, 136, 229, 207, 255, 112, 187 ] } } }, "version": { "Sequence": { "Buffer": { "data": [ 0 ] } } } } } }, { "UInt": 762745 }, { "UInt": 2 } ] } } }
+  );
+  assert_eq(
+    JSON.stringify(ret),
+    JSON.stringify({
+      cc_payload: { "address": { "version": 22, "bytes": "0000000000000000000000000000000000000000" }, "contract_name": "pox", "function_name": "stack-stx", "function_args": [ { "UInt": 560004000000 }, { "Tuple": { "type_signature": { "type_map": { "hashbytes": { "SequenceType": { "BufferType": 20 } }, "version": { "SequenceType": { "BufferType": 1 } } } }, "data_map": { "hashbytes": { "Sequence": { "Buffer": { "data": [ 228, 203, 158, 176, 37, 12, 216, 229, 246, 127, 199, 160, 80, 2, 136, 229, 207, 255, 112, 187 ] } } }, "version": { "Sequence": { "Buffer": { "data": [ 0 ] } } } } } }, { "UInt": 762745 }, { "UInt": 2 } ] },
+      tx_sender: 'SP3XWM51THFSJ9GM7CMY26T3CVBZEHTSCJKQK3H46'
+    })
+  );
+
+  ret = get_stacking_payload(
+    true,
+    CONFIG.boot_addr,
+    "pox",
+    { "version": "Mainnet", "chain_id": 1, "auth": { "Standard": { "Singlesig": { "hash_mode": "P2PKH", "signer": "ad1bb87661788cda09f3e9b16d02d4db4080681d", "nonce": 3, "tx_fee": 3000, "key_encoding": "Compressed", "signature": "00932c252a4438cb6da8fa4d368e8133b859178e89fd4686756210ad6e94325bc5666457979df74a32c5e068939c7e0803e46b97db74a3d9b805fa745b1c971273" } } }, "anchor_mode": "Any", "post_condition_mode": "Deny", "post_conditions": [], "payload": { "ContractCall": { "address": { "version": 22, "bytes": "0000000000000000000000000000000000000000" }, "contract_name": "pox", "function_name": "delegate-stx", "function_args": [ { "UInt": 855000000 }, { "Principal": { "Standard": [ 22, [ 244, 217, 251, 216, 215, 158, 225, 138, 161, 73, 16, 68, 13, 28, 116, 132, 88, 116, 128, 248 ] ] } }, { "Optional": { "data": { "UInt": 766850 } } }, { "Optional": { "data": null } } ] } } }
+  );
+  assert_eq(
+    JSON.stringify(ret),
+    JSON.stringify({
+      cc_payload: { "address": { "version": 22, "bytes": "0000000000000000000000000000000000000000" }, "contract_name": "pox", "function_name": "delegate-stx", "function_args": [ { "UInt": 855000000 }, { "Principal": { "Standard": [ 22, [ 244, 217, 251, 216, 215, 158, 225, 138, 161, 73, 16, 68, 13, 28, 116, 132, 88, 116, 128, 248 ] ] } }, { "Optional": { "data": { "UInt": 766850 } } }, { "Optional": { "data": null } } ] },
+      tx_sender: "SP2PHQE3PC5W8SPG9YFMV2V82TKDM10383QMRQKK9",
+    })
+  );
+
+  ret = get_stacking_payload(
+    true,
+    CONFIG.boot_addr,
+    "pox",
+    { "version": "Mainnet", "chain_id": 1, "auth": { "Standard": { "Singlesig": { "hash_mode": "P2PKH", "signer": "a24416b2e6c340f7791d50ca1893a0805808bd2c", "nonce": 524, "tx_fee": 10000, "key_encoding": "Compressed", "signature": "01b9970858256d0c9dcccec9083fbc9bc72c270af9a0756a6c87ef3847b6c03bfb511a84262f92e703492e47d23c914350e543843b8baf64c495ea1745ec3376f0" } } }, "anchor_mode": "Any", "post_condition_mode": "Deny", "post_conditions": [], "payload": { "ContractCall": { "address": { "version": 22, "bytes": "0000000000000000000000000000000000000000" }, "contract_name": "pox", "function_name": "delegate-stack-stx", "function_args": [ { "Principal": { "Standard": [ 22, [ 187, 249, 231, 10, 114, 186, 147, 60, 106, 193, 130, 163, 112, 97, 158, 56, 250, 17, 158, 248 ] ] } }, { "UInt": 100000000 }, { "Tuple": { "type_signature": { "type_map": { "hashbytes": { "SequenceType": { "BufferType": 20 } }, "version": { "SequenceType": { "BufferType": 1 } } } }, "data_map": { "hashbytes": { "Sequence": { "Buffer": { "data": [ 13, 80, 91, 196, 21, 227, 14, 120, 138, 18, 196, 240, 107, 184, 168, 164, 66, 53, 97, 146 ] } } }, "version": { "Sequence": { "Buffer": { "data": [ 0 ] } } } } } }, { "UInt": 763551 }, { "UInt": 1 } ] } } }
+  );
+  assert_eq(
+    JSON.stringify(ret),
+    JSON.stringify({
+      cc_payload: { "address": { "version": 22, "bytes": "0000000000000000000000000000000000000000" }, "contract_name": "pox", "function_name": "delegate-stack-stx", "function_args": [ { "Principal": { "Standard": [ 22, [ 187, 249, 231, 10, 114, 186, 147, 60, 106, 193, 130, 163, 112, 97, 158, 56, 250, 17, 158, 248 ] ] } }, { "UInt": 100000000 }, { "Tuple": { "type_signature": { "type_map": { "hashbytes": { "SequenceType": { "BufferType": 20 } }, "version": { "SequenceType": { "BufferType": 1 } } } }, "data_map": { "hashbytes": { "Sequence": { "Buffer": { "data": [ 13, 80, 91, 196, 21, 227, 14, 120, 138, 18, 196, 240, 107, 184, 168, 164, 66, 53, 97, 146 ] } } }, "version": { "Sequence": { "Buffer": { "data": [ 0 ] } } } } } }, { "UInt": 763551 }, { "UInt": 1 } ] },
+      tx_sender: "SP2H485NJWV1M1XVS3N8CM64KM205G25X5JZ8FR04"
+    })
+  );
+}
+
+function test_decode_stacking_payload() {
+  console.log("decode_stacking_payload");
+  let ret = decode_stacking_payload({
+    cc_payload: { "address": { "version": 22, "bytes": "0000000000000000000000000000000000000000" }, "contract_name": "pox", "function_name": "stack-stx", "function_args": [ { "UInt": 560004000000 }, { "Tuple": { "type_signature": { "type_map": { "hashbytes": { "SequenceType": { "BufferType": 20 } }, "version": { "SequenceType": { "BufferType": 1 } } } }, "data_map": { "hashbytes": { "Sequence": { "Buffer": { "data": [ 228, 203, 158, 176, 37, 12, 216, 229, 246, 127, 199, 160, 80, 2, 136, 229, 207, 255, 112, 187 ] } } }, "version": { "Sequence": { "Buffer": { "data": [ 0 ] } } } } } }, { "UInt": 762745 }, { "UInt": 2 } ] },
+    tx_sender: 'SP3XWM51THFSJ9GM7CMY26T3CVBZEHTSCJKQK3H46'
+  });
+  assert_eq(
+    JSON.stringify(ret),
+    JSON.stringify({
+      function_name: "stack-stx",
+      stacker: "SP3XWM51THFSJ9GM7CMY26T3CVBZEHTSCJKQK3H46",
+      delegator: null
+    })
+  );
+
+  ret = decode_stacking_payload({
+    cc_payload: { "address": { "version": 22, "bytes": "0000000000000000000000000000000000000000" }, "contract_name": "pox", "function_name": "delegate-stx", "function_args": [ { "UInt": 855000000 }, { "Principal": { "Standard": [ 22, [ 244, 217, 251, 216, 215, 158, 225, 138, 161, 73, 16, 68, 13, 28, 116, 132, 88, 116, 128, 248 ] ] } }, { "Optional": { "data": { "UInt": 766850 } } }, { "Optional": { "data": null } } ] },
+    tx_sender: "SP2PHQE3PC5W8SPG9YFMV2V82TKDM10383QMRQKK9"
+  });
+  assert_eq(
+    JSON.stringify(ret),
+    JSON.stringify({
+      function_name: "delegate-stx",
+      stacker: "SP2PHQE3PC5W8SPG9YFMV2V82TKDM10383QMRQKK9",
+      delegator: "SP3TDKYYRTYFE32N19484838WEJ25GX40Z24GECPZ", 
+    })
+  );
+
+  ret = decode_stacking_payload({
+    cc_payload: { "address": { "version": 22, "bytes": "0000000000000000000000000000000000000000" }, "contract_name": "pox", "function_name": "delegate-stack-stx", "function_args": [ { "Principal": { "Standard": [ 22, [ 187, 249, 231, 10, 114, 186, 147, 60, 106, 193, 130, 163, 112, 97, 158, 56, 250, 17, 158, 248 ] ] } }, { "UInt": 100000000 }, { "Tuple": { "type_signature": { "type_map": { "hashbytes": { "SequenceType": { "BufferType": 20 } }, "version": { "SequenceType": { "BufferType": 1 } } } }, "data_map": { "hashbytes": { "Sequence": { "Buffer": { "data": [ 13, 80, 91, 196, 21, 227, 14, 120, 138, 18, 196, 240, 107, 184, 168, 164, 66, 53, 97, 146 ] } } }, "version": { "Sequence": { "Buffer": { "data": [ 0 ] } } } } } }, { "UInt": 763551 }, { "UInt": 1 } ] },
+    tx_sender: "SP2H485NJWV1M1XVS3N8CM64KM205G25X5JZ8FR04"
+  });
+
+  assert_eq(
+    JSON.stringify(ret),
+    JSON.stringify({
+      function_name: "delegate-stack-stx",
+      stacker: "SP2XZKSRAEAX96F3AR61A6W31KRWFM4CYZ0JK9HB5",
+      delegator: "SP2H485NJWV1M1XVS3N8CM64KM205G25X5JZ8FR04"
+    })
+  );
+}
+
+function test_decode_stack_stx_tx() {
+  console.log("decode_stack_stx_tx");
+  let ret = decode_stack_stx_tx(
+    { "sender": { "version": 20, "bytes": "a7d3c8cf27c034be518b73c0efafe862f38c20fe" }, "reward_addr": { "version": 20, "bytes": "36ebcc4aae88fb089a612d3a60039967fcb59143" }, "stacked_ustx": 25000000000000, "num_cycles": 5, "txid": [ 175, 123, 210, 156, 82, 103, 70, 22, 115, 67, 131, 174, 208, 17, 170, 38, 164, 103, 111, 198, 240, 55, 194, 61, 77, 250, 37, 226, 104, 109, 15, 9 ], "vtxindex": 78, "block_height": 737311, "burn_header_hash": [ 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 8, 41, 33, 127, 49, 45, 53, 253, 34, 103, 174, 134, 251, 113, 75, 153, 67, 227, 171, 11, 184, 174 ] }
+  );
+
+  assert_eq(
+    JSON.stringify(ret),
+    JSON.stringify({
+      function_name: "stack-stx",
+      stacker: "SM2KX7J6F4Z039FJHHDSW1VXFX1HF7310ZSNDRGCK",
+      delegator: null
+    })
+  );
+}
+
+function test_decode_tx_jsons() {
+  console.log("decode_tx_jsons");
+  let ret = decode_tx_jsons(
+    CONFIG,
+    [
+      { "version": "Mainnet", "chain_id": 1, "auth": { "Standard": { "Singlesig": { "hash_mode": "P2PKH", "signer": "fbca143a8bf324c287653c23686cdafee8eb2c94", "nonce": 6, "tx_fee": 260, "key_encoding": "Compressed", "signature": "00c45198553fd92306b545e73d8c62ab6207271c12a219863d206938fa71abc53f6da9c80f270363708adf12793c833445a7a08db4c8ec35272be4e789c68d2249" } } }, "anchor_mode": "Any", "post_condition_mode": "Deny", "post_conditions": [], "payload": { "ContractCall": { "address": { "version": 22, "bytes": "0000000000000000000000000000000000000000" }, "contract_name": "pox", "function_name": "stack-stx", "function_args": [ { "UInt": 560004000000 }, { "Tuple": { "type_signature": { "type_map": { "hashbytes": { "SequenceType": { "BufferType": 20 } }, "version": { "SequenceType": { "BufferType": 1 } } } }, "data_map": { "hashbytes": { "Sequence": { "Buffer": { "data": [ 228, 203, 158, 176, 37, 12, 216, 229, 246, 127, 199, 160, 80, 2, 136, 229, 207, 255, 112, 187 ] } } }, "version": { "Sequence": { "Buffer": { "data": [ 0 ] } } } } } }, { "UInt": 762745 }, { "UInt": 2 } ] } } },
+      { "version": "Mainnet", "chain_id": 1, "auth": { "Standard": { "Singlesig": { "hash_mode": "P2PKH", "signer": "ad1bb87661788cda09f3e9b16d02d4db4080681d", "nonce": 3, "tx_fee": 3000, "key_encoding": "Compressed", "signature": "00932c252a4438cb6da8fa4d368e8133b859178e89fd4686756210ad6e94325bc5666457979df74a32c5e068939c7e0803e46b97db74a3d9b805fa745b1c971273" } } }, "anchor_mode": "Any", "post_condition_mode": "Deny", "post_conditions": [], "payload": { "ContractCall": { "address": { "version": 22, "bytes": "0000000000000000000000000000000000000000" }, "contract_name": "pox", "function_name": "delegate-stx", "function_args": [ { "UInt": 855000000 }, { "Principal": { "Standard": [ 22, [ 244, 217, 251, 216, 215, 158, 225, 138, 161, 73, 16, 68, 13, 28, 116, 132, 88, 116, 128, 248 ] ] } }, { "Optional": { "data": { "UInt": 766850 } } }, { "Optional": { "data": null } } ] } } },
+      { "version": "Mainnet", "chain_id": 1, "auth": { "Standard": { "Singlesig": { "hash_mode": "P2PKH", "signer": "a24416b2e6c340f7791d50ca1893a0805808bd2c", "nonce": 524, "tx_fee": 10000, "key_encoding": "Compressed", "signature": "01b9970858256d0c9dcccec9083fbc9bc72c270af9a0756a6c87ef3847b6c03bfb511a84262f92e703492e47d23c914350e543843b8baf64c495ea1745ec3376f0" } } }, "anchor_mode": "Any", "post_condition_mode": "Deny", "post_conditions": [], "payload": { "ContractCall": { "address": { "version": 22, "bytes": "0000000000000000000000000000000000000000" }, "contract_name": "pox", "function_name": "delegate-stack-stx", "function_args": [ { "Principal": { "Standard": [ 22, [ 187, 249, 231, 10, 114, 186, 147, 60, 106, 193, 130, 163, 112, 97, 158, 56, 250, 17, 158, 248 ] ] } }, { "UInt": 100000000 }, { "Tuple": { "type_signature": { "type_map": { "hashbytes": { "SequenceType": { "BufferType": 20 } }, "version": { "SequenceType": { "BufferType": 1 } } } }, "data_map": { "hashbytes": { "Sequence": { "Buffer": { "data": [ 13, 80, 91, 196, 21, 227, 14, 120, 138, 18, 196, 240, 107, 184, 168, 164, 66, 53, 97, 146 ] } } }, "version": { "Sequence": { "Buffer": { "data": [ 0 ] } } } } } }, { "UInt": 763551 }, { "UInt": 1 } ] } } },
+      // not a stacking op -- wrong contract name
+      { "version": "Mainnet", "chain_id": 1, "auth": { "Standard": { "Singlesig": { "hash_mode": "P2PKH", "signer": "a24416b2e6c340f7791d50ca1893a0805808bd2c", "nonce": 524, "tx_fee": 10000, "key_encoding": "Compressed", "signature": "01b9970858256d0c9dcccec9083fbc9bc72c270af9a0756a6c87ef3847b6c03bfb511a84262f92e703492e47d23c914350e543843b8baf64c495ea1745ec3376f0" } } }, "anchor_mode": "Any", "post_condition_mode": "Deny", "post_conditions": [], "payload": { "ContractCall": { "address": { "version": 22, "bytes": "0000000000000000000000000000000000000000" }, "contract_name": "not-pox", "function_name": "delegate-stack-stx", "function_args": [ { "Principal": { "Standard": [ 22, [ 187, 249, 231, 10, 114, 186, 147, 60, 106, 193, 130, 163, 112, 97, 158, 56, 250, 17, 158, 248 ] ] } }, { "UInt": 100000000 }, { "Tuple": { "type_signature": { "type_map": { "hashbytes": { "SequenceType": { "BufferType": 20 } }, "version": { "SequenceType": { "BufferType": 1 } } } }, "data_map": { "hashbytes": { "Sequence": { "Buffer": { "data": [ 13, 80, 91, 196, 21, 227, 14, 120, 138, 18, 196, 240, 107, 184, 168, 164, 66, 53, 97, 146 ] } } }, "version": { "Sequence": { "Buffer": { "data": [ 0 ] } } } } } }, { "UInt": 763551 }, { "UInt": 1 } ] } } }
+    ]
+  );
+
+  assert_eq(
+    JSON.stringify(ret),
+    JSON.stringify([
+      {
+        function_name: "stack-stx",
+        stacker: "SP3XWM51THFSJ9GM7CMY26T3CVBZEHTSCJKQK3H46",
+        delegator: null
+      },
+      {
+        function_name: "delegate-stx",
+        stacker: "SP2PHQE3PC5W8SPG9YFMV2V82TKDM10383QMRQKK9",
+        delegator: "SP3TDKYYRTYFE32N19484838WEJ25GX40Z24GECPZ", 
+      },
+      {
+        function_name: "delegate-stack-stx",
+        stacker: "SP2XZKSRAEAX96F3AR61A6W31KRWFM4CYZ0JK9HB5",
+        delegator: "SP2H485NJWV1M1XVS3N8CM64KM205G25X5JZ8FR04"
+      }
+    ])
+  );
+}
+
+function test_find_potential_stackers() {
+  console.log("find_potential_stackers");
+  let ret = find_potential_stackers(
+    CONFIG,
+    [
+      {
+        "stack_stx_txs": [
+          { "sender": { "version": 20, "bytes": "a7d3c8cf27c034be518b73c0efafe862f38c20fe" }, "reward_addr": { "version": 20, "bytes": "36ebcc4aae88fb089a612d3a60039967fcb59143" }, "stacked_ustx": 25000000000000, "num_cycles": 5, "txid": [ 175, 123, 210, 156, 82, 103, 70, 22, 115, 67, 131, 174, 208, 17, 170, 38, 164, 103, 111, 198, 240, 55, 194, 61, 77, 250, 37, 226, 104, 109, 15, 9 ], "vtxindex": 78, "block_height": 737311, "burn_header_hash": [ 0, 0, 0, 0, 0, 0, 0, 0, 0, 5, 8, 41, 33, 127, 49, 45, 53, 253, 34, 103, 174, 134, 251, 113, 75, 153, 67, 227, 171, 11, 184, 174 ] }
+        ],
+        "transfer_stx_txs": [
+
+        ],
+        "block_txs": [
+          { "version": "Mainnet", "chain_id": 1, "auth": { "Standard": { "Singlesig": { "hash_mode": "P2PKH", "signer": "fbca143a8bf324c287653c23686cdafee8eb2c94", "nonce": 6, "tx_fee": 260, "key_encoding": "Compressed", "signature": "00c45198553fd92306b545e73d8c62ab6207271c12a219863d206938fa71abc53f6da9c80f270363708adf12793c833445a7a08db4c8ec35272be4e789c68d2249" } } }, "anchor_mode": "Any", "post_condition_mode": "Deny", "post_conditions": [], "payload": { "ContractCall": { "address": { "version": 22, "bytes": "0000000000000000000000000000000000000000" }, "contract_name": "pox", "function_name": "stack-stx", "function_args": [ { "UInt": 560004000000 }, { "Tuple": { "type_signature": { "type_map": { "hashbytes": { "SequenceType": { "BufferType": 20 } }, "version": { "SequenceType": { "BufferType": 1 } } } }, "data_map": { "hashbytes": { "Sequence": { "Buffer": { "data": [ 228, 203, 158, 176, 37, 12, 216, 229, 246, 127, 199, 160, 80, 2, 136, 229, 207, 255, 112, 187 ] } } }, "version": { "Sequence": { "Buffer": { "data": [ 0 ] } } } } } }, { "UInt": 762745 }, { "UInt": 2 } ] } } },
+        ],
+        "microblock_txs": [
+          [
+            { "version": "Mainnet", "chain_id": 1, "auth": { "Standard": { "Singlesig": { "hash_mode": "P2PKH", "signer": "ad1bb87661788cda09f3e9b16d02d4db4080681d", "nonce": 3, "tx_fee": 3000, "key_encoding": "Compressed", "signature": "00932c252a4438cb6da8fa4d368e8133b859178e89fd4686756210ad6e94325bc5666457979df74a32c5e068939c7e0803e46b97db74a3d9b805fa745b1c971273" } } }, "anchor_mode": "Any", "post_condition_mode": "Deny", "post_conditions": [], "payload": { "ContractCall": { "address": { "version": 22, "bytes": "0000000000000000000000000000000000000000" }, "contract_name": "pox", "function_name": "delegate-stx", "function_args": [ { "UInt": 855000000 }, { "Principal": { "Standard": [ 22, [ 244, 217, 251, 216, 215, 158, 225, 138, 161, 73, 16, 68, 13, 28, 116, 132, 88, 116, 128, 248 ] ] } }, { "Optional": { "data": { "UInt": 766850 } } }, { "Optional": { "data": null } } ] } } },
+            // duplicate
+            { "version": "Mainnet", "chain_id": 1, "auth": { "Standard": { "Singlesig": { "hash_mode": "P2PKH", "signer": "a24416b2e6c340f7791d50ca1893a0805808bd2c", "nonce": 524, "tx_fee": 10000, "key_encoding": "Compressed", "signature": "01b9970858256d0c9dcccec9083fbc9bc72c270af9a0756a6c87ef3847b6c03bfb511a84262f92e703492e47d23c914350e543843b8baf64c495ea1745ec3376f0" } } }, "anchor_mode": "Any", "post_condition_mode": "Deny", "post_conditions": [], "payload": { "ContractCall": { "address": { "version": 22, "bytes": "0000000000000000000000000000000000000000" }, "contract_name": "pox", "function_name": "delegate-stack-stx", "function_args": [ { "Principal": { "Standard": [ 22, [ 187, 249, 231, 10, 114, 186, 147, 60, 106, 193, 130, 163, 112, 97, 158, 56, 250, 17, 158, 248 ] ] } }, { "UInt": 100000000 }, { "Tuple": { "type_signature": { "type_map": { "hashbytes": { "SequenceType": { "BufferType": 20 } }, "version": { "SequenceType": { "BufferType": 1 } } } }, "data_map": { "hashbytes": { "Sequence": { "Buffer": { "data": [ 13, 80, 91, 196, 21, 227, 14, 120, 138, 18, 196, 240, 107, 184, 168, 164, 66, 53, 97, 146 ] } } }, "version": { "Sequence": { "Buffer": { "data": [ 0 ] } } } } } }, { "UInt": 763551 }, { "UInt": 1 } ] } } },
+          ],
+          [
+            { "version": "Mainnet", "chain_id": 1, "auth": { "Standard": { "Singlesig": { "hash_mode": "P2PKH", "signer": "a24416b2e6c340f7791d50ca1893a0805808bd2c", "nonce": 524, "tx_fee": 10000, "key_encoding": "Compressed", "signature": "01b9970858256d0c9dcccec9083fbc9bc72c270af9a0756a6c87ef3847b6c03bfb511a84262f92e703492e47d23c914350e543843b8baf64c495ea1745ec3376f0" } } }, "anchor_mode": "Any", "post_condition_mode": "Deny", "post_conditions": [], "payload": { "ContractCall": { "address": { "version": 22, "bytes": "0000000000000000000000000000000000000000" }, "contract_name": "pox", "function_name": "delegate-stack-stx", "function_args": [ { "Principal": { "Standard": [ 22, [ 187, 249, 231, 10, 114, 186, 147, 60, 106, 193, 130, 163, 112, 97, 158, 56, 250, 17, 158, 248 ] ] } }, { "UInt": 100000000 }, { "Tuple": { "type_signature": { "type_map": { "hashbytes": { "SequenceType": { "BufferType": 20 } }, "version": { "SequenceType": { "BufferType": 1 } } } }, "data_map": { "hashbytes": { "Sequence": { "Buffer": { "data": [ 13, 80, 91, 196, 21, 227, 14, 120, 138, 18, 196, 240, 107, 184, 168, 164, 66, 53, 97, 146 ] } } }, "version": { "Sequence": { "Buffer": { "data": [ 0 ] } } } } } }, { "UInt": 763551 }, { "UInt": 1 } ] } } },
+          ]
+        ]
+      }
+    ]
+  );
+
+  assert_eq(
+    JSON.stringify(ret),
+    JSON.stringify({
+      stackers: [
+        "SM2KX7J6F4Z039FJHHDSW1VXFX1HF7310ZSNDRGCK",
+        "SP2PHQE3PC5W8SPG9YFMV2V82TKDM10383QMRQKK9",
+        "SP2XZKSRAEAX96F3AR61A6W31KRWFM4CYZ0JK9HB5",
+        "SP3XWM51THFSJ9GM7CMY26T3CVBZEHTSCJKQK3H46",
+      ],
+      delegates: [
+        "SP2PHQE3PC5W8SPG9YFMV2V82TKDM10383QMRQKK9",
+      ],
+      delegators: [
+        "SP2H485NJWV1M1XVS3N8CM64KM205G25X5JZ8FR04",
+        "SP3TDKYYRTYFE32N19484838WEJ25GX40Z24GECPZ",
+      ]
+    })
+  );
+}
+
+async function test_build_reward_cycle_delegation_table() {
+  console.log("build_reward_cycle_delegation_table");
+  let ret = await build_reward_cycle_delegation_table(
+    CONFIG,
+    [
+      "SPNYMG0TCS0YJTVR0XJVMNQNZDJJNQ5CGY6X1VV1",
+      // after tip
+      "SP112X4579W7T14D9GMRYCYVHNMVQS3C4274DNWNP",
+      // revoked
+      "SP2PHQE3PC5W8SPG9YFMV2V82TKDM10383QMRQKK9",
+      // not delegating
+      "SP3TDKYYRTYFE32N19484838WEJ25GX40Z24GECPZ",
+      // stacking
+      "SM2KX7J6F4Z039FJHHDSW1VXFX1HF7310ZSNDRGCK",
+    ],
+    CONFIG.cycles[0]
+  );
+  assert_eq(Object.keys(ret).length, 1);
+  const addr = Object.keys(ret)[0];
+  assert_eq(addr, "SPNYMG0TCS0YJTVR0XJVMNQNZDJJNQ5CGY6X1VV1");
+  assert_eq(ret[addr].ustx, 862000000000n);
+  assert_eq(ret[addr].delegate_to, "SP700C57YJFD5RGHK0GN46478WBAM2KG3A4MN2QJ");
+  assert_eq(ret[addr].until_burn_ht, 771050n);
+}
+
+async function test_get_reward_cycle_stackers() {
+  console.log("get_reward_cycle_stackers");
+  let ret = await get_reward_cycle_stackers(
+    CONFIG,
+    [
+      "SM2KX7J6F4Z039FJHHDSW1VXFX1HF7310ZSNDRGCK",
+      // has delegated
+      "SPNYMG0TCS0YJTVR0XJVMNQNZDJJNQ5CGY6X1VV1"
+    ],
+    {
+      "SPNYMG0TCS0YJTVR0XJVMNQNZDJJNQ5CGY6X1VV1": {
+        until_burn_ht: 771050n,
+        ustx: 862000000000n,
+        delegate_to: "SP700C57YJFD5RGHK0GN46478WBAM2KG3A4MN2QJ"
+      }
+    },
+    CONFIG.cycles[0]
+  );
+
+  // TODO: check against stacking.club
+  assert_eq(ret["SM2KX7J6F4Z039FJHHDSW1VXFX1HF7310ZSNDRGCK"].pox_address, "36hQtSEXBMevo5chpxhfAGiCTSC34QKgda");
+  assert_eq(ret["SM2KX7J6F4Z039FJHHDSW1VXFX1HF7310ZSNDRGCK"].ustx, 25000000000000n);
+  assert_eq(ret["SM2KX7J6F4Z039FJHHDSW1VXFX1HF7310ZSNDRGCK"].delegating, false);
+
+  assert_eq(ret["SPNYMG0TCS0YJTVR0XJVMNQNZDJJNQ5CGY6X1VV1"].pox_address, "33WSGLeVoEpuZDjB54HKZ1y5YsERELoVNq");
+  assert_eq(ret["SPNYMG0TCS0YJTVR0XJVMNQNZDJJNQ5CGY6X1VV1"].ustx, 862000000000n);
+  assert_eq(ret["SPNYMG0TCS0YJTVR0XJVMNQNZDJJNQ5CGY6X1VV1"].delegating, true);
+}
+
+async function tests() {
+  test_decode_scriptsig();
+  await test_get_stacker_info();
+  await test_get_delegation_info();
+  test_decode_auth_signer();
+  test_decode_tx_sender();
+  test_get_stacking_payload();
+  test_decode_stacking_payload();
+  test_decode_stack_stx_tx();
+  test_decode_tx_jsons();
+  test_find_potential_stackers();
+  await test_build_reward_cycle_delegation_table();
+  await test_get_reward_cycle_stackers()
+}
+
+tests();
+// main()
