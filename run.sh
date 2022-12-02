@@ -1,7 +1,5 @@
 #!/bin/bash
 
-set -oue pipefail
-
 DATA="./data"
 LIBEXEC="./libexec"
 START_RC=33
@@ -11,6 +9,8 @@ VOTE_RC_1=46
 VOTE_RC_2=47
 
 PROGNAME="$0"
+
+set -oue pipefail
 
 error_exit() {
    echo >&2 "$@" 
