@@ -5,6 +5,7 @@ const bitcoin = require('bitcoinjs-lib');
 const process = require('node:process');
 const fs = require('node:fs');
 const stx = require("@stacks/transactions");
+const stx_common = require('@stacks/common');
 
 const CONFIG = {
   mainnet: true,
@@ -320,12 +321,12 @@ function is_stacker_delegating(stx_addr, delegating_table, cur_burn_height) {
 //    until_burn_ht: if given, the height at which the delegation expires (as a bigint), or null if it doesn't expire
 // }
 async function get_delegation_info(config, stacker_addr, cur_burn_height, chain_tip) {
-  const stacker_cv = stx.serializeCV(stx.tupleCV({ "stacker": stx.standardPrincipalCV(stacker_addr) })).toString('hex');
+  const stacker_cv = stx_common.bytesToHex(stx.serializeCV(stx.tupleCV({ "stacker": stx.standardPrincipalCV(stacker_addr) })))
   const stacker_info_cv_hex = await get_map_entry(config.node, config.boot_addr, config.pox, "delegation-state", stacker_cv, chain_tip);
   if (!stacker_info_cv_hex) {
     throw 'Failed to get delegate sttate'
   }
-  if (stacker_info_cv_hex == `0x${stx.serializeCV(stx.noneCV()).toString('hex')}`) {
+  if (stacker_info_cv_hex == `0x${stx_common.bytesToHex(stx.serializeCV(stx.noneCV()))}`) {
     return null;
   }
   else {
@@ -359,20 +360,20 @@ async function get_delegation_info(config, stacker_addr, cur_burn_height, chain_
 //    delegating: whether or not these STX are delegated to someone else (as a bool)
 // }
 async function get_stacker_info(config, stacker_addr, cur_burn_height, chain_tip, delegating_table) {
-  const stacker_cv = stx.serializeCV(stx.standardPrincipalCV(stacker_addr)).toString('hex');
+  const stacker_cv = stx_common.bytesToHex(stx.serializeCV(stx.standardPrincipalCV(stacker_addr)));
   const stacker_info_cv_hex = await call_read_only(config.node, config.boot_addr, config.pox, "get-stacker-info", [stacker_cv], config.mainnet, 'SP31DA6FTSJX2WGTZ69SFY11BH51NZMB0ZW97B5P0', chain_tip);
   if (!stacker_info_cv_hex) {
     throw 'Failed to get stacker info'
   }
 
-  if (stacker_info_cv_hex == `0x${stx.serializeCV(stx.noneCV()).toString('hex')}`) {
+  if (stacker_info_cv_hex == `0x${stx_common.bytesToHex(stx.serializeCV(stx.noneCV()))}`) {
     return null;
   }
   else {
     const result = stx.hexToCV(stacker_info_cv_hex);
     const amount_stacked = result.value.data['amount-ustx'].value;
     const pox_addr_version = result.value.data['pox-addr'].data.version.buffer;
-    const pox_addr_hashbytes = result.value.data['pox-addr'].data.hashbytes.buffer;
+    const pox_addr_hashbytes = Buffer.from(result.value.data['pox-addr'].data.hashbytes.buffer);
     const pox_addr = pox_addr_to_btc_addr(config.mainnet, pox_addr_version, pox_addr_hashbytes);
     const is_delegating = is_stacker_delegating(stacker_addr, delegating_table, cur_burn_height);
     const ret = {
@@ -1639,5 +1640,5 @@ async function tests() {
   await test_get_reward_cycle_stackers()
 }
 
-tests();
-// main()
+// tests();
+main()

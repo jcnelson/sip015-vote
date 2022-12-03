@@ -18,7 +18,7 @@ error_exit() {
 }
 
 usage() {
-   error_exit "$PROGNAME /path/to/bitcoin.conf /path/to/chainstate/root"
+   error_exit "Usage: $PROGNAME /path/to/bitcoin.conf /path/to/chainstate/root"
 }
 
 debug() {
@@ -33,14 +33,14 @@ check_deps() {
    # stderr: none
    # return: 0 on success; exit on error
    local cmd=""
-   for cmd in jq stacks-inspect; do
-      if ! command -v "$cmd"; then 
+   for cmd in jq stacks-inspect grep; do
+      if ! command -v "$cmd" >/dev/null; then 
          error_exit "Missing command $cmd"
       fi
    done
 
    # stacks-inspect must support `dump-txs`
-   if ! stacks-inspect dump-txs 2>&1 | grep 'dump-txs'; then
+   if [ -z "$(stacks-inspect dump-txs 2>&1 | grep 'dump-txs')" ]; then
       error_exit "stacks-inspect does not appear to support dump-txs"
    fi
 
@@ -70,7 +70,7 @@ get_tx_dumps() {
       fi
 
       debug "Fetching reward cycle data for reward cycle $rc"
-      stacks-inspect dump-txs "$chainstate_root" "$rc"
+      RUST_BACKTRACE=full BLOCKSTACK_DEBUG=1 stacks-inspect dump-txs "$chainstate_root" "$rc" >"$cycle_path"
    done
 
    return 0
@@ -83,8 +83,8 @@ find_stackers() {
    # stdout: none
    # stderr: lots of diagnostics
    # return: 0 on success, non-zero on error
-   "$LIBEXEC/addrtool" find-stackers "$VOTE_RC_1" "$DATA/cycle-*.json" > "$DATA/potential-stackers-$VOTE_RC_1.json"
-   "$LIBEXEC/addrtool" find-stackers "$VOTE_RC_2" "$DATA/cycle-*.json" > "$DATA/potential-stackers-$VOTE_RC_2.json"
+   "$LIBEXEC/addrtool" find-stackers "$VOTE_RC_1" "$DATA"/cycle-*.json > "$DATA/potential-stackers-$VOTE_RC_1.json"
+   "$LIBEXEC/addrtool" find-stackers "$VOTE_RC_2" "$DATA"/cycle-*.json > "$DATA/potential-stackers-$VOTE_RC_2.json"
    return 0
 }
 
@@ -96,7 +96,7 @@ combine_stackers() {
    # stdout: none
    # stderr: lots of diagnostics
    # return: 0 on success, non-zero on error
-   "$LIBEXEC/addrtool" combine-stackers "$DATA/potential-stackers-*.json" > "$DATA/all-stackers.json"
+   "$LIBEXEC/addrtool" combine-stackers "$DATA"/potential-stackers-*.json > "$DATA/all-stackers.json"
    return 0
 }
 
@@ -131,7 +131,7 @@ get_pool_stacker_votes() {
    # stdout: none
    # stderr: lots of diagnostics
    # return: 0 on success, non-zero on error
-   "$LIBEXEC/addrtool" pool-stacker-vote "$DATA/all-stackers.json" "$DATA/potential-stackers-$VOTE_RC_1.json" "$DATA/potential-stackers-$VOTE_RC_2.json" > "$DATA/pool-votes.json"
+   "$LIBEXEC/addrtool" pool-stacker-votes "$DATA/all-stackers.json" "$DATA/cycle-$VOTE_RC_1.json" "$DATA/cycle-$VOTE_RC_2.json" > "$DATA/pool-votes.json"
    return 0
 }
 
@@ -146,8 +146,12 @@ tabulate_votes() {
 }
 
 main() {
+   if [ "$#" -ne 2 ]; then
+      usage
+   fi
    local bitcoin_conf="$1"
    local chainstate_root="$2"
+   mkdir -p "$DATA"
    if [ -z "$bitcoin_conf" ]; then
       usage
    fi
@@ -162,13 +166,13 @@ main() {
       error_exit "Not a directory we can access: $chainstate_root"
    fi
 
-   check_deps
-   get_tx_dumps "$chainstate_root"
-   find_stackers
-   combine_stackers
-   get_btc_votes "$bitcoin_conf"
-   get_solo_stacker_votes
-   get_pool_stacker_votes
+   # check_deps
+   # get_tx_dumps "$chainstate_root"
+   # find_stackers
+   # combine_stackers
+   # get_btc_votes "$bitcoin_conf"
+   # get_solo_stacker_votes
+   # get_pool_stacker_votes
    tabulate_votes
    
    echo "Final tabulation in $DATA/votes-final.json"
