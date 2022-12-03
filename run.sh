@@ -166,13 +166,13 @@ main() {
       error_exit "Not a directory we can access: $chainstate_root"
    fi
 
-   # check_deps
-   # get_tx_dumps "$chainstate_root"
-   # find_stackers
-   # combine_stackers
-   # get_btc_votes "$bitcoin_conf"
-   # get_solo_stacker_votes
-   # get_pool_stacker_votes
+   check_deps
+   get_tx_dumps "$chainstate_root"
+   find_stackers
+   combine_stackers
+   get_btc_votes "$bitcoin_conf"
+   get_solo_stacker_votes
+   get_pool_stacker_votes
    tabulate_votes
    
    echo "Final tabulation in $DATA/votes-final.json"
